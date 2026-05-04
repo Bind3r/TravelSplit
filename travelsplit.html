@@ -1,0 +1,659 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>TravelSplit</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-50">
+  <div id="root"></div>
+
+  <script src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+
+  <script type="text/babel">
+    const { useState, useEffect, useReducer, createContext, useContext } = React;
+
+    // ── UUID ──────────────────────────────────────────────────────────────────
+    function uuidv4() {
+      return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (c) => {
+        const r = (Math.random() * 16) | 0;
+        return (c === 'x' ? r : (r & 0x3) | 0x8).toString(16);
+      });
+    }
+
+    // ── Currencies ────────────────────────────────────────────────────────────
+    const CURRENCIES = [
+      { code: 'EUR', symbol: '€' }, { code: 'USD', symbol: '$' },
+      { code: 'GBP', symbol: '£' }, { code: 'CHF', symbol: 'Fr' },
+      { code: 'JPY', symbol: '¥' }, { code: 'CAD', symbol: 'CA$' },
+      { code: 'AUD', symbol: 'A$' }, { code: 'SEK', symbol: 'kr' },
+      { code: 'NOK', symbol: 'kr' }, { code: 'DKK', symbol: 'kr' },
+      { code: 'PLN', symbol: 'zł' }, { code: 'CZK', symbol: 'Kč' },
+      { code: 'HUF', symbol: 'Ft' }, { code: 'MXN', symbol: 'MX$' },
+      { code: 'BRL', symbol: 'R$' }, { code: 'INR', symbol: '₹' },
+      { code: 'CNY', symbol: '¥' }, { code: 'KRW', symbol: '₩' },
+      { code: 'TRY', symbol: '₺' }, { code: 'THB', symbol: '฿' },
+    ];
+    const sym = (code) => CURRENCIES.find((c) => c.code === code)?.symbol ?? code;
+    const fmt = (amount, currency) => `${sym(currency)}${amount.toFixed(2)}`;
+
+    // ── Balance calculation ───────────────────────────────────────────────────
+    function calculateBalances(trip) {
+      const net = {};
+      for (const p of trip.people) net[p.id] = 0;
+      for (const e of trip.expenses) {
+        if (!e.splitBetweenIds.length) continue;
+        const share = e.amount / e.splitBetweenIds.length;
+        if (net[e.paidById] !== undefined) net[e.paidById] += e.amount;
+        for (const id of e.splitBetweenIds)
+          if (net[id] !== undefined) net[id] -= share;
+      }
+      const totalSpent = trip.expenses.reduce((s, e) => s + e.amount, 0);
+      const creditors = Object.entries(net).filter(([,v]) => v > 0.005)
+        .map(([id, amount]) => ({ id, amount })).sort((a, b) => b.amount - a.amount);
+      const debtors = Object.entries(net).filter(([,v]) => v < -0.005)
+        .map(([id, amount]) => ({ id, amount: -amount })).sort((a, b) => b.amount - a.amount);
+      const settlements = [];
+      let i = 0, j = 0;
+      while (i < debtors.length && j < creditors.length) {
+        const amount = Math.min(debtors[i].amount, creditors[j].amount);
+        settlements.push({ from: debtors[i].id, to: creditors[j].id, amount: Math.round(amount * 100) / 100 });
+        debtors[i].amount -= amount; creditors[j].amount -= amount;
+        if (debtors[i].amount < 0.005) i++;
+        if (creditors[j].amount < 0.005) j++;
+      }
+      return { netBalances: net, settlements, totalSpent };
+    }
+
+    // ── Store (Context + useReducer + localStorage) ───────────────────────────
+    const STORAGE_KEY = 'travelsplit-v1';
+    const load = () => { try { const r = localStorage.getItem(STORAGE_KEY); return r ? JSON.parse(r) : { trips: [] }; } catch { return { trips: [] }; } };
+    const save = (s) => { try { localStorage.setItem(STORAGE_KEY, JSON.stringify(s)); } catch {} };
+
+    function reducer(state, action) {
+      let next;
+      switch (action.type) {
+        case 'ADD_TRIP':
+          next = { ...state, trips: [...state.trips, { id: action.id, name: action.name, description: action.description, currency: action.currency, people: [], expenses: [], createdAt: new Date().toISOString() }] }; break;
+        case 'UPDATE_TRIP':
+          next = { ...state, trips: state.trips.map((t) => t.id === action.id ? { ...t, name: action.name, description: action.description, currency: action.currency } : t) }; break;
+        case 'DELETE_TRIP':
+          next = { ...state, trips: state.trips.filter((t) => t.id !== action.id) }; break;
+        case 'ADD_PERSON':
+          next = { ...state, trips: state.trips.map((t) => t.id === action.tripId ? { ...t, people: [...t.people, { id: action.pid, name: action.name }] } : t) }; break;
+        case 'DEL_PERSON':
+          next = { ...state, trips: state.trips.map((t) => t.id === action.tripId ? { ...t, people: t.people.filter((p) => p.id !== action.pid) } : t) }; break;
+        case 'ADD_EXPENSE':
+          next = { ...state, trips: state.trips.map((t) => t.id === action.tripId ? { ...t, expenses: [...t.expenses, { ...action.expense, id: action.id }] } : t) }; break;
+        case 'UPDATE_EXPENSE':
+          next = { ...state, trips: state.trips.map((t) => t.id === action.tripId ? { ...t, expenses: t.expenses.map((e) => e.id === action.expense.id ? action.expense : e) } : t) }; break;
+        case 'DEL_EXPENSE':
+          next = { ...state, trips: state.trips.map((t) => t.id === action.tripId ? { ...t, expenses: t.expenses.filter((e) => e.id !== action.eid) } : t) }; break;
+        default: return state;
+      }
+      save(next); return next;
+    }
+
+    const Ctx = createContext(null);
+    function StoreProvider({ children }) {
+      const [state, dispatch] = useReducer(reducer, null, load);
+      return <Ctx.Provider value={{ state, dispatch }}>{children}</Ctx.Provider>;
+    }
+    const useStore = () => useContext(Ctx);
+
+    // ── Hash router ───────────────────────────────────────────────────────────
+    function useRoute() {
+      const [hash, setHash] = useState(window.location.hash || '#/');
+      useEffect(() => {
+        const h = () => setHash(window.location.hash || '#/');
+        window.addEventListener('hashchange', h);
+        return () => window.removeEventListener('hashchange', h);
+      }, []);
+      if (hash.startsWith('#/trip/')) return { page: 'trip', tripId: hash.replace('#/trip/', '') };
+      return { page: 'trips' };
+    }
+    const go = (path) => { window.location.hash = path; };
+
+    // ── Modal ─────────────────────────────────────────────────────────────────
+    function Modal({ title, onClose, children }) {
+      return (
+        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4"
+          onClick={(e) => e.target === e.currentTarget && onClose()}>
+          <div className="bg-white rounded-2xl shadow-xl w-full max-w-md max-h-[90vh] flex flex-col">
+            <div className="flex items-center justify-between px-6 py-4 border-b border-gray-100">
+              <h2 className="text-base font-semibold text-gray-900">{title}</h2>
+              <button onClick={onClose} className="p-1 rounded-lg hover:bg-gray-100 text-gray-400 hover:text-gray-600 transition-colors">
+                <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+                </svg>
+              </button>
+            </div>
+            <div className="flex-1 overflow-y-auto px-6 py-5">{children}</div>
+          </div>
+        </div>
+      );
+    }
+
+    // ── TripModal ─────────────────────────────────────────────────────────────
+    function TripModal({ trip, onSave, onClose }) {
+      const [name, setName] = useState(trip?.name ?? '');
+      const [desc, setDesc] = useState(trip?.description ?? '');
+      const [cur, setCur] = useState(trip?.currency ?? 'EUR');
+      const submit = (e) => { e.preventDefault(); if (name.trim()) onSave(name.trim(), desc.trim(), cur); };
+      return (
+        <Modal title={trip ? 'Edit Trip' : 'New Trip'} onClose={onClose}>
+          <form onSubmit={submit} className="space-y-4">
+            <div>
+              <label className="block text-sm font-medium text-gray-700 mb-1">Trip name *</label>
+              <input value={name} onChange={(e) => setName(e.target.value)} placeholder="e.g. Paris 2025" autoFocus
+                className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500" />
+            </div>
+            <div>
+              <label className="block text-sm font-medium text-gray-700 mb-1">Description</label>
+              <input value={desc} onChange={(e) => setDesc(e.target.value)} placeholder="Optional"
+                className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500" />
+            </div>
+            <div>
+              <label className="block text-sm font-medium text-gray-700 mb-1">Default currency</label>
+              <select value={cur} onChange={(e) => setCur(e.target.value)}
+                className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500">
+                {CURRENCIES.map((c) => <option key={c.code} value={c.code}>{c.code}</option>)}
+              </select>
+            </div>
+            <div className="flex gap-3 pt-1">
+              <button type="button" onClick={onClose} className="flex-1 border border-gray-300 rounded-lg px-4 py-2 text-sm font-medium text-gray-700 hover:bg-gray-50 transition-colors">Cancel</button>
+              <button type="submit" disabled={!name.trim()} className="flex-1 bg-indigo-600 hover:bg-indigo-700 disabled:bg-indigo-300 text-white rounded-lg px-4 py-2 text-sm font-medium transition-colors">
+                {trip ? 'Save changes' : 'Create trip'}
+              </button>
+            </div>
+          </form>
+        </Modal>
+      );
+    }
+
+    // ── ExpenseModal ──────────────────────────────────────────────────────────
+    function ExpenseModal({ trip, expense, onSave, onClose }) {
+      const [desc, setDesc] = useState(expense?.description ?? '');
+      const [amount, setAmount] = useState(expense?.amount?.toString() ?? '');
+      const [cur, setCur] = useState(expense?.currency ?? trip.currency);
+      const [paidBy, setPaidBy] = useState(expense?.paidById ?? (trip.people[0]?.id ?? ''));
+      const [split, setSplit] = useState(expense?.splitBetweenIds ?? trip.people.map((p) => p.id));
+      const [date, setDate] = useState(expense?.date ?? new Date().toISOString().split('T')[0]);
+
+      if (trip.people.length === 0)
+        return <Modal title="Add Expense" onClose={onClose}><p className="text-gray-500 text-sm mb-4">Add people to the trip first.</p><button onClick={onClose} className="w-full bg-indigo-600 text-white rounded-lg px-4 py-2 text-sm font-medium">Got it</button></Modal>;
+
+      const toggle = (id) => setSplit((prev) => prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id]);
+      const parsed = parseFloat(amount);
+      const share = !isNaN(parsed) && parsed > 0 && split.length > 0 ? parsed / split.length : null;
+      const valid = desc.trim() && !isNaN(parsed) && parsed > 0 && paidBy && split.length > 0;
+
+      const submit = (e) => {
+        e.preventDefault();
+        if (!valid) return;
+        onSave({ description: desc.trim(), amount: parsed, currency: cur, paidById: paidBy, splitBetweenIds: split, date });
+      };
+
+      return (
+        <Modal title={expense ? 'Edit Expense' : 'Add Expense'} onClose={onClose}>
+          <form onSubmit={submit} className="space-y-4">
+            <div>
+              <label className="block text-sm font-medium text-gray-700 mb-1">Description *</label>
+              <input value={desc} onChange={(e) => setDesc(e.target.value)} placeholder="e.g. Restaurant dinner" autoFocus
+                className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500" />
+            </div>
+            <div className="flex gap-3">
+              <div className="flex-1">
+                <label className="block text-sm font-medium text-gray-700 mb-1">Amount *</label>
+                <input type="number" value={amount} onChange={(e) => setAmount(e.target.value)} placeholder="0.00" min="0.01" step="0.01"
+                  className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500" />
+              </div>
+              <div className="w-24">
+                <label className="block text-sm font-medium text-gray-700 mb-1">Currency</label>
+                <select value={cur} onChange={(e) => setCur(e.target.value)}
+                  className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500">
+                  {CURRENCIES.map((c) => <option key={c.code} value={c.code}>{c.code}</option>)}
+                </select>
+              </div>
+            </div>
+            <div>
+              <label className="block text-sm font-medium text-gray-700 mb-1">Date</label>
+              <input type="date" value={date} onChange={(e) => setDate(e.target.value)}
+                className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500" />
+            </div>
+            <div>
+              <label className="block text-sm font-medium text-gray-700 mb-1">Paid by *</label>
+              <select value={paidBy} onChange={(e) => setPaidBy(e.target.value)}
+                className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500">
+                {trip.people.map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}
+              </select>
+            </div>
+            <div>
+              <div className="flex items-center justify-between mb-2">
+                <label className="text-sm font-medium text-gray-700">Split between *</label>
+                <button type="button" onClick={() => setSplit(trip.people.map((p) => p.id))} className="text-xs text-indigo-600 hover:underline">Select all</button>
+              </div>
+              <div className="space-y-1.5 bg-gray-50 rounded-lg p-3">
+                {trip.people.map((p) => {
+                  const checked = split.includes(p.id);
+                  return (
+                    <label key={p.id} className="flex items-center gap-3 cursor-pointer py-0.5">
+                      <input type="checkbox" checked={checked} onChange={() => toggle(p.id)} className="w-4 h-4 text-indigo-600 rounded border-gray-300" />
+                      <span className="flex-1 text-sm text-gray-700">{p.name}</span>
+                      {checked && share !== null && <span className="text-xs text-gray-400 font-medium">{sym(cur)}{share.toFixed(2)}</span>}
+                    </label>
+                  );
+                })}
+              </div>
+              {split.length === 0 && <p className="text-xs text-red-500 mt-1">Select at least one person</p>}
+            </div>
+            <div className="flex gap-3 pt-1">
+              <button type="button" onClick={onClose} className="flex-1 border border-gray-300 rounded-lg px-4 py-2 text-sm font-medium text-gray-700 hover:bg-gray-50 transition-colors">Cancel</button>
+              <button type="submit" disabled={!valid} className="flex-1 bg-indigo-600 hover:bg-indigo-700 disabled:bg-indigo-300 text-white rounded-lg px-4 py-2 text-sm font-medium transition-colors">
+                {expense ? 'Save changes' : 'Add expense'}
+              </button>
+            </div>
+          </form>
+        </Modal>
+      );
+    }
+
+    // ── Icon helpers ──────────────────────────────────────────────────────────
+    const IconEdit = () => (
+      <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z" />
+      </svg>
+    );
+    const IconTrash = ({ small }) => (
+      <svg className={small ? 'w-3.5 h-3.5' : 'w-4 h-4'} fill="none" viewBox="0 0 24 24" stroke="currentColor">
+        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
+      </svg>
+    );
+    const IconPlus = () => (
+      <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 4v16m8-8H4" />
+      </svg>
+    );
+    const IconBack = () => (
+      <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 19l-7-7 7-7" />
+      </svg>
+    );
+    const IconX = () => (
+      <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+      </svg>
+    );
+
+    // ── TripsPage ─────────────────────────────────────────────────────────────
+    function TripsPage() {
+      const { state, dispatch } = useStore();
+      const [showCreate, setShowCreate] = useState(false);
+      const [editingId, setEditingId] = useState(null);
+      const editing = state.trips.find((t) => t.id === editingId);
+
+      const create = (name, desc, cur) => {
+        const id = uuidv4();
+        dispatch({ type: 'ADD_TRIP', id, name, description: desc, currency: cur });
+        setShowCreate(false);
+        go(`#/trip/${id}`);
+      };
+      const update = (name, desc, cur) => {
+        dispatch({ type: 'UPDATE_TRIP', id: editingId, name, description: desc, currency: cur });
+        setEditingId(null);
+      };
+      const del = (e, id) => {
+        e.stopPropagation();
+        if (confirm('Delete this trip? This cannot be undone.'))
+          dispatch({ type: 'DELETE_TRIP', id });
+      };
+
+      const sorted = state.trips.slice().sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+
+      return (
+        <div className="min-h-screen bg-gray-50">
+          <header className="bg-white border-b border-gray-200 sticky top-0 z-10">
+            <div className="max-w-2xl mx-auto px-4 py-4 flex items-center justify-between">
+              <div>
+                <h1 className="text-xl font-bold text-gray-900">TravelSplit</h1>
+                <p className="text-xs text-gray-400">Split travel expenses effortlessly</p>
+              </div>
+              <button onClick={() => setShowCreate(true)} className="bg-indigo-600 hover:bg-indigo-700 text-white text-sm font-medium px-4 py-2 rounded-lg transition-colors flex items-center gap-1.5">
+                <IconPlus /> New Trip
+              </button>
+            </div>
+          </header>
+
+          <main className="max-w-2xl mx-auto px-4 py-6">
+            {sorted.length === 0 ? (
+              <div className="text-center py-20">
+                <div className="text-5xl mb-4">✈️</div>
+                <h2 className="text-lg font-semibold text-gray-900 mb-2">No trips yet</h2>
+                <p className="text-sm text-gray-500 mb-6">Create your first trip to start splitting expenses</p>
+                <button onClick={() => setShowCreate(true)} className="bg-indigo-600 hover:bg-indigo-700 text-white text-sm font-medium px-6 py-2.5 rounded-lg transition-colors">Create a trip</button>
+              </div>
+            ) : (
+              <div className="space-y-3">
+                {sorted.map((trip) => {
+                  const total = trip.expenses.reduce((s, e) => s + e.amount, 0);
+                  return (
+                    <div key={trip.id} onClick={() => go(`#/trip/${trip.id}`)}
+                      className="bg-white rounded-xl border border-gray-200 p-4 hover:border-indigo-200 hover:shadow-sm transition-all cursor-pointer">
+                      <div className="flex items-start justify-between gap-3">
+                        <div className="flex-1 min-w-0">
+                          <h3 className="font-semibold text-gray-900 truncate">{trip.name}</h3>
+                          {trip.description && <p className="text-sm text-gray-500 truncate mt-0.5">{trip.description}</p>}
+                          <div className="flex items-center gap-2 mt-2 text-xs text-gray-400">
+                            <span>{trip.people.length} {trip.people.length === 1 ? 'person' : 'people'}</span>
+                            <span>·</span><span>{trip.expenses.length} expenses</span>
+                            <span>·</span><span className="font-medium text-gray-600">{fmt(total, trip.currency)}</span>
+                          </div>
+                        </div>
+                        <div className="flex items-center gap-1 flex-shrink-0" onClick={(e) => e.stopPropagation()}>
+                          <button onClick={() => setEditingId(trip.id)} className="p-1.5 text-gray-400 hover:text-indigo-600 hover:bg-indigo-50 rounded-lg transition-colors"><IconEdit /></button>
+                          <button onClick={(e) => del(e, trip.id)} className="p-1.5 text-gray-400 hover:text-red-600 hover:bg-red-50 rounded-lg transition-colors"><IconTrash /></button>
+                        </div>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </main>
+
+          {showCreate && <TripModal onSave={create} onClose={() => setShowCreate(false)} />}
+          {editing && <TripModal trip={editing} onSave={update} onClose={() => setEditingId(null)} />}
+        </div>
+      );
+    }
+
+    // ── TripDetailPage ────────────────────────────────────────────────────────
+    function TripDetailPage({ tripId }) {
+      const { state, dispatch } = useStore();
+      const trip = state.trips.find((t) => t.id === tripId);
+      const [tab, setTab] = useState('overview');
+      const [showEditTrip, setShowEditTrip] = useState(false);
+      const [showAddExp, setShowAddExp] = useState(false);
+      const [editingExp, setEditingExp] = useState(null);
+      const [personName, setPersonName] = useState('');
+
+      if (!trip) return (
+        <div className="min-h-screen bg-gray-50 flex items-center justify-center">
+          <div className="text-center">
+            <p className="text-gray-500 mb-4">Trip not found.</p>
+            <button onClick={() => go('#/')} className="text-indigo-600 text-sm hover:underline">← Back</button>
+          </div>
+        </div>
+      );
+
+      const { netBalances, settlements, totalSpent } = calculateBalances(trip);
+      const pname = (id) => trip.people.find((p) => p.id === id)?.name ?? 'Unknown';
+      const personUsed = (id) => trip.expenses.some((e) => e.paidById === id || e.splitBetweenIds.includes(id));
+
+      const addPerson = (e) => {
+        e.preventDefault();
+        const name = personName.trim();
+        if (!name) return;
+        dispatch({ type: 'ADD_PERSON', tripId: trip.id, pid: uuidv4(), name });
+        setPersonName('');
+      };
+      const delPerson = (pid) => {
+        if (personUsed(pid)) { alert('Cannot remove: person is part of expenses.'); return; }
+        dispatch({ type: 'DEL_PERSON', tripId: trip.id, pid });
+      };
+      const delExpense = (eid) => {
+        if (confirm('Delete this expense?')) dispatch({ type: 'DEL_EXPENSE', tripId: trip.id, eid });
+      };
+      const delTrip = () => {
+        if (confirm('Delete this trip? This cannot be undone.')) { dispatch({ type: 'DELETE_TRIP', id: trip.id }); go('#/'); }
+      };
+
+      const tabs = [
+        { id: 'overview', label: 'Overview' },
+        { id: 'expenses', label: 'Expenses', badge: trip.expenses.length },
+        { id: 'people', label: 'People', badge: trip.people.length },
+      ];
+      const sortedExp = trip.expenses.slice().sort((a, b) => new Date(b.date) - new Date(a.date));
+
+      return (
+        <div className="min-h-screen bg-gray-50">
+          <header className="bg-white border-b border-gray-200 sticky top-0 z-10">
+            <div className="max-w-2xl mx-auto px-4 pt-4">
+              <div className="flex items-center gap-3">
+                <button onClick={() => go('#/')} className="text-gray-400 hover:text-gray-700 p-1 rounded-lg hover:bg-gray-100 flex-shrink-0 transition-colors"><IconBack /></button>
+                <div className="flex-1 min-w-0">
+                  <h1 className="font-bold text-gray-900 truncate">{trip.name}</h1>
+                  {trip.description && <p className="text-xs text-gray-400 truncate">{trip.description}</p>}
+                </div>
+                <div className="flex items-center gap-1 flex-shrink-0">
+                  <button onClick={() => setShowEditTrip(true)} className="p-1.5 text-gray-400 hover:text-indigo-600 hover:bg-indigo-50 rounded-lg transition-colors"><IconEdit /></button>
+                  <button onClick={delTrip} className="p-1.5 text-gray-400 hover:text-red-600 hover:bg-red-50 rounded-lg transition-colors"><IconTrash /></button>
+                </div>
+              </div>
+              <div className="flex mt-4">
+                {tabs.map((t) => (
+                  <button key={t.id} onClick={() => setTab(t.id)}
+                    className={`px-4 py-2.5 text-sm font-medium border-b-2 transition-colors ${tab === t.id ? 'border-indigo-600 text-indigo-600' : 'border-transparent text-gray-500 hover:text-gray-700'}`}>
+                    {t.label}
+                    {t.badge > 0 && (
+                      <span className={`ml-1.5 text-xs px-1.5 py-0.5 rounded-full ${tab === t.id ? 'bg-indigo-100 text-indigo-600' : 'bg-gray-100 text-gray-500'}`}>{t.badge}</span>
+                    )}
+                  </button>
+                ))}
+              </div>
+            </div>
+          </header>
+
+          <main className="max-w-2xl mx-auto px-4 py-6">
+
+            {/* ── OVERVIEW ── */}
+            {tab === 'overview' && (
+              <div className="space-y-4">
+                <div className="grid grid-cols-3 gap-3">
+                  {[['Total spent', fmt(totalSpent, trip.currency)], ['People', trip.people.length], ['Expenses', trip.expenses.length]].map(([label, value]) => (
+                    <div key={label} className="bg-white rounded-xl border border-gray-200 p-4 text-center">
+                      <div className="text-xl font-bold text-gray-900 tabular-nums">{value}</div>
+                      <div className="text-xs text-gray-400 mt-1">{label}</div>
+                    </div>
+                  ))}
+                </div>
+
+                {trip.people.length === 0 && (
+                  <p className="text-center py-10 text-sm text-gray-400">
+                    Start by <button onClick={() => setTab('people')} className="text-indigo-600 hover:underline">adding people</button> to the trip.
+                  </p>
+                )}
+
+                {trip.people.length > 0 && (
+                  <div className="bg-white rounded-xl border border-gray-200 overflow-hidden">
+                    <div className="px-4 py-3 border-b border-gray-100"><h2 className="text-sm font-semibold text-gray-900">Balances</h2></div>
+                    <div className="divide-y divide-gray-50">
+                      {trip.people.map((person) => {
+                        const b = netBalances[person.id] ?? 0;
+                        const pos = b > 0.005, neg = b < -0.005;
+                        return (
+                          <div key={person.id} className="px-4 py-3 flex items-center justify-between">
+                            <div className="flex items-center gap-2.5">
+                              <div className="w-7 h-7 rounded-full bg-indigo-100 flex items-center justify-center flex-shrink-0">
+                                <span className="text-xs font-bold text-indigo-600">{person.name[0].toUpperCase()}</span>
+                              </div>
+                              <span className="text-sm text-gray-800">{person.name}</span>
+                            </div>
+                            <div className="flex items-center gap-2">
+                              {pos && <span className="text-xs text-emerald-600 bg-emerald-50 px-2 py-0.5 rounded-full">gets back</span>}
+                              {neg && <span className="text-xs text-red-500 bg-red-50 px-2 py-0.5 rounded-full">owes</span>}
+                              <span className={`text-sm font-semibold tabular-nums ${pos ? 'text-emerald-600' : neg ? 'text-red-500' : 'text-gray-400'}`}>
+                                {neg ? '−' : ''}{fmt(Math.abs(b), trip.currency)}
+                              </span>
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
+                )}
+
+                {settlements.length > 0 && (
+                  <div className="bg-white rounded-xl border border-gray-200 overflow-hidden">
+                    <div className="px-4 py-3 border-b border-gray-100"><h2 className="text-sm font-semibold text-gray-900">Who pays who</h2></div>
+                    <div className="divide-y divide-gray-50">
+                      {settlements.map((s, i) => (
+                        <div key={i} className="px-4 py-3 flex items-center gap-3">
+                          <div className="w-7 h-7 rounded-full bg-red-100 flex items-center justify-center flex-shrink-0">
+                            <span className="text-xs font-bold text-red-500">{pname(s.from)[0].toUpperCase()}</span>
+                          </div>
+                          <div className="flex-1 text-sm text-gray-700">
+                            <span className="font-medium">{pname(s.from)}</span>
+                            <span className="text-gray-400 mx-2">→</span>
+                            <span className="font-medium">{pname(s.to)}</span>
+                          </div>
+                          <span className="text-sm font-semibold text-gray-900 tabular-nums">{fmt(s.amount, trip.currency)}</span>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+
+                {settlements.length === 0 && trip.expenses.length > 0 && (
+                  <div className="bg-emerald-50 border border-emerald-200 rounded-xl p-4 text-center">
+                    <p className="text-emerald-700 text-sm font-medium">All settled up! 🎉</p>
+                  </div>
+                )}
+
+                {trip.expenses.length === 0 && trip.people.length > 0 && (
+                  <p className="text-center py-6 text-sm text-gray-400">
+                    No expenses yet. <button onClick={() => setTab('expenses')} className="text-indigo-600 hover:underline">Add the first one</button>
+                  </p>
+                )}
+              </div>
+            )}
+
+            {/* ── EXPENSES ── */}
+            {tab === 'expenses' && (
+              <div className="space-y-4">
+                <div className="flex justify-end">
+                  <button onClick={() => setShowAddExp(true)} className="bg-indigo-600 hover:bg-indigo-700 text-white text-sm font-medium px-4 py-2 rounded-lg transition-colors flex items-center gap-1.5">
+                    <IconPlus /> Add expense
+                  </button>
+                </div>
+                {sortedExp.length === 0 ? (
+                  <div className="text-center py-14 text-gray-400">
+                    <div className="text-4xl mb-3">🧾</div>
+                    <p className="text-sm">No expenses yet</p>
+                    {trip.people.length === 0 && <p className="text-xs mt-1">Add people first</p>}
+                  </div>
+                ) : (
+                  <div className="space-y-2">
+                    {sortedExp.map((e) => {
+                      const label = e.splitBetweenIds.length === trip.people.length ? 'all' : e.splitBetweenIds.map(pname).join(', ');
+                      return (
+                        <div key={e.id} className="bg-white rounded-xl border border-gray-200 px-4 py-3">
+                          <div className="flex items-start justify-between gap-3">
+                            <div className="flex-1 min-w-0">
+                              <p className="text-sm font-medium text-gray-900 truncate">{e.description}</p>
+                              <p className="text-xs text-gray-400 mt-0.5">
+                                Paid by <span className="text-gray-600 font-medium">{pname(e.paidById)}</span>
+                                {' · '}Split between <span className="text-gray-600">{label}</span>
+                                {' · '}{new Date(e.date).toLocaleDateString('en-GB', { day: 'numeric', month: 'short' })}
+                              </p>
+                            </div>
+                            <div className="flex items-center gap-1 flex-shrink-0">
+                              <span className="text-sm font-semibold text-gray-900 tabular-nums mr-1">{fmt(e.amount, e.currency)}</span>
+                              <button onClick={() => setEditingExp(e)} className="p-1.5 text-gray-400 hover:text-indigo-600 hover:bg-indigo-50 rounded-lg transition-colors"><IconEdit /></button>
+                              <button onClick={() => delExpense(e.id)} className="p-1.5 text-gray-400 hover:text-red-600 hover:bg-red-50 rounded-lg transition-colors"><IconTrash small /></button>
+                            </div>
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* ── PEOPLE ── */}
+            {tab === 'people' && (
+              <div className="space-y-4">
+                <form onSubmit={addPerson} className="flex gap-2">
+                  <input value={personName} onChange={(e) => setPersonName(e.target.value)} placeholder="Person's name"
+                    className="flex-1 border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500" />
+                  <button type="submit" disabled={!personName.trim()} className="bg-indigo-600 hover:bg-indigo-700 disabled:bg-indigo-300 text-white text-sm font-medium px-5 py-2 rounded-lg transition-colors">Add</button>
+                </form>
+                {trip.people.length === 0 ? (
+                  <div className="text-center py-14 text-gray-400">
+                    <div className="text-4xl mb-3">👥</div>
+                    <p className="text-sm">No people added yet</p>
+                  </div>
+                ) : (
+                  <div className="bg-white rounded-xl border border-gray-200 divide-y divide-gray-50 overflow-hidden">
+                    {trip.people.map((person) => {
+                      const b = netBalances[person.id] ?? 0;
+                      const used = personUsed(person.id);
+                      return (
+                        <div key={person.id} className="px-4 py-3 flex items-center justify-between">
+                          <div className="flex items-center gap-3">
+                            <div className="w-9 h-9 rounded-full bg-indigo-100 flex items-center justify-center flex-shrink-0">
+                              <span className="text-sm font-bold text-indigo-600">{person.name[0].toUpperCase()}</span>
+                            </div>
+                            <div>
+                              <p className="text-sm font-medium text-gray-900">{person.name}</p>
+                              {trip.expenses.length > 0 && (
+                                <p className={`text-xs ${b > 0.005 ? 'text-emerald-600' : b < -0.005 ? 'text-red-500' : 'text-gray-400'}`}>
+                                  {b > 0.005 ? `Gets back ${fmt(Math.abs(b), trip.currency)}` : b < -0.005 ? `Owes ${fmt(Math.abs(b), trip.currency)}` : 'Settled up'}
+                                </p>
+                              )}
+                            </div>
+                          </div>
+                          <button onClick={() => delPerson(person.id)} disabled={used} title={used ? 'Person is in expenses' : 'Remove'}
+                            className={`p-1.5 rounded-lg transition-colors ${used ? 'text-gray-200 cursor-not-allowed' : 'text-gray-400 hover:text-red-600 hover:bg-red-50'}`}>
+                            <IconX />
+                          </button>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
+            )}
+          </main>
+
+          {showEditTrip && (
+            <TripModal trip={trip}
+              onSave={(name, desc, cur) => { dispatch({ type: 'UPDATE_TRIP', id: trip.id, name, description: desc, currency: cur }); setShowEditTrip(false); }}
+              onClose={() => setShowEditTrip(false)} />
+          )}
+
+          {(showAddExp || editingExp !== null) && (
+            <ExpenseModal trip={trip} expense={editingExp}
+              onSave={(data) => {
+                if (editingExp) {
+                  dispatch({ type: 'UPDATE_EXPENSE', tripId: trip.id, expense: { ...data, id: editingExp.id } });
+                  setEditingExp(null);
+                } else {
+                  dispatch({ type: 'ADD_EXPENSE', tripId: trip.id, id: uuidv4(), expense: data });
+                  setShowAddExp(false);
+                }
+              }}
+              onClose={() => { setShowAddExp(false); setEditingExp(null); }} />
+          )}
+        </div>
+      );
+    }
+
+    // ── App ───────────────────────────────────────────────────────────────────
+    function App() {
+      const route = useRoute();
+      return (
+        <StoreProvider>
+          {route.page === 'trip' ? <TripDetailPage tripId={route.tripId} /> : <TripsPage />}
+        </StoreProvider>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+  </script>
+</body>
+</html>
